@@ -476,8 +476,8 @@ class MusicControlView(discord.ui.View):
         await interaction.response.send_message(f"Shuffle: {status}", ephemeral=True)
         await update_now_playing(self.guild_id)
 
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, custom_id="stop")
-    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="Stop", style=discord.ButtonStyle.danger, custom_id="stop_button")
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not await dj_check(interaction):
             return
             
@@ -487,7 +487,8 @@ class MusicControlView(discord.ui.View):
         if interaction.guild.voice_client:
             interaction.guild.voice_client.stop()
         await interaction.response.send_message("Stopped!", ephemeral=True)
-        self.stop()
+        # Stop the view from listening for more interactions
+        super().stop()
 
 
 class SearchSelectMenu(discord.ui.Select):
