@@ -37,9 +37,8 @@ ytdl_format_options = {
     'default_search': 'auto',
     'source_address': '0.0.0.0',
     'extract_flat': False,
-    'age_limit': None,
-    'cachedir': False,
-    'no_color': True,
+    'socket_timeout': 30,  # Add this
+    'retries': 3,  # Add this
 }
 
 ffmpeg_base_options = {
@@ -692,106 +691,322 @@ async def play_next(guild_id):
 #                              SLASH COMMANDS - PLAYBACK
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#                    ADVANCED INTERACTION HANDLING & UTILITIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class InteractionHandler:
+    """Advanced interaction handler with timeout protection and error recovery"""
+    
+    @staticmethod
+    async def safe_defer(interaction: discord.Interaction, ephemeral: bool = False):
+        """Safely defer an interaction with timeout protection"""
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=ephemeral)
+                return True
+        except discord.NotFound:
+            logger.warning(f"Interaction expired before defer: {interaction.id}")
+            return False
+        except Exception as e:
+            logger.error(f"Error deferring interaction: {e}")
+            return False
+        return True
+    
+    @staticmethod
+    async def safe_response(interaction: discord.Interaction, embed=None, content=None, 
+                          view=None, ephemeral=False, edit=False):
+        """Safely send or edit interaction response with fallback handling"""
+        try:
+            if interaction.response.is_done():
+                if edit and interaction.message:
+                    return await interaction.message.edit(embed=embed, content=content, view=view)
+                else:
+                    return await interaction.followup.send(
+                        embed=embed, content=content, view=view, ephemeral=ephemeral
+                    )
+            else:
+                return await interaction.response.send_message(
+                    embed=embed, content=content, view=view, ephemeral=ephemeral
+                )
+        except discord.NotFound:
+            logger.warning(f"Interaction not found when responding: {interaction.id}")
+            # Try channel fallback
+            if interaction.channel:
+                try:
+                    return await interaction.channel.send(embed=embed, content=content, view=view)
+                except:
+                    pass
+        except discord.HTTPException as e:
+            logger.error(f"HTTP error in safe_response: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error in safe_response: {e}")
+        return None
+
+class ProgressTracker:
+    """Track and display progress for long-running operations"""
+    
+    def __init__(self, interaction: discord.Interaction, title: str, total_steps: int = 100):
+        self.interaction = interaction
+        self.title = title
+        self.total_steps = total_steps
+        self.current_step = 0
+        self.message = None
+        self.last_update = 0
+        self.update_interval = 2  # Update every 2 seconds minimum
+    
+    async def start(self):
+        """Initialize progress tracking"""
+        embed = create_embed(self.title, "Starting...", 0x9b59b6)
+        self.message = await InteractionHandler.safe_response(self.interaction, embed=embed)
+        self.last_update = time.time()
+    
+    async def update(self, step: int, description: str = None):
+        """Update progress with throttling"""
+        self.current_step = step
+        current_time = time.time()
+        
+        # Throttle updates to avoid rate limits
+        if current_time - self.last_update < self.update_interval and step < self.total_steps:
+            return
+        
+        percentage = int((step / self.total_steps) * 100)
+        filled = int(percentage / 10)
+        bar = "█" * filled + "░" * (10 - filled)
+        
+        embed = create_embed(
+            self.title,
+            f"{description or 'Processing...'}\n\n`{bar}` {percentage}%",
+            0x9b59b6
+        )
+        
+        if self.message:
+            try:
+                await self.message.edit(embed=embed)
+                self.last_update = current_time
+            except:
+                pass
+    
+    async def complete(self, final_embed):
+        """Mark operation as complete"""
+        if self.message:
+            try:
+                await self.message.edit(embed=final_embed)
+            except:
+                pass
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                    ADVANCED PLAY COMMAND WITH SMART LOADING
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @bot.tree.command(name="play", description="Play a song from YouTube")
 @app_commands.describe(query="Song name or YouTube URL")
 async def play_slash(interaction: discord.Interaction, query: str):
+    # Voice channel validation
     if not interaction.user.voice:
-        embed = create_embed("Error", "You need to be in a voice channel!", 0xf44336)
+        embed = create_embed("❌ Error", "You need to be in a voice channel!", 0xf44336)
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
     
-    await interaction.response.defer()
+    # CRITICAL: Defer immediately (within 3 seconds)
+    if not await InteractionHandler.safe_defer(interaction):
+        return
     
-    if not interaction.guild.voice_client:
-        await interaction.user.voice.channel.connect()
+    # Show initial loading message
+    loading_embed = create_embed(
+        "🔍 Searching",
+        f"Looking for: **{query[:100]}**\n\nPlease wait...",
+        0x9b59b6
+    )
+    loading_msg = await InteractionHandler.safe_response(interaction, embed=loading_embed)
     
     try:
+        # Connect to voice if not already
+        if not interaction.guild.voice_client:
+            try:
+                await interaction.user.voice.channel.connect()
+            except Exception as e:
+                embed = create_embed("❌ Connection Failed", f"Couldn't join voice: {str(e)}", 0xf44336)
+                await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
+                return
+        
+        # Prepare search query
         if not query.startswith('http'):
             query = f'ytsearch:{query}'
         
         queue = get_queue(interaction.guild_id)
         queue.text_channel = interaction.channel
-        player = await YTDLSource.from_url(
-            query,
-            loop=bot.loop,
-            stream=True,
-            requester=interaction.user,
-            audio_filter=queue.audio_filter
-        )
+        
+        # Update loading message
+        if loading_msg:
+            try:
+                loading_embed.description = f"Looking for: **{query[:100]}**\n\n⏳ Fetching audio data..."
+                await loading_msg.edit(embed=loading_embed)
+            except:
+                pass
+        
+        # Fetch audio source (this is the slow part)
+        start_time = time.time()
+        try:
+            player = await asyncio.wait_for(
+                YTDLSource.from_url(
+                    query,
+                    loop=bot.loop,
+                    stream=True,
+                    requester=interaction.user,
+                    audio_filter=queue.audio_filter
+                ),
+                timeout=60  # 60 second timeout for fetching
+            )
+        except asyncio.TimeoutError:
+            embed = create_embed(
+                "⏱️ Timeout",
+                "Request took too long. Try again or use a different song.",
+                0xff9800
+            )
+            await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
+            return
+        except Exception as e:
+            embed = create_embed(
+                "❌ Failed to Load",
+                f"Error: {str(e)[:200]}\n\nTry a different song or check the URL.",
+                0xf44336
+            )
+            await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
+            return
+        
+        fetch_time = time.time() - start_time
+        logger.info(f"Fetched {player.title} in {fetch_time:.2f}s")
+        
         player.volume = queue.volume / 100
         
+        # Check if something is already playing
         if interaction.guild.voice_client.is_playing() or interaction.guild.voice_client.is_paused():
             queue.add(player)
-            embed = create_music_embed(player, "Added to Queue", queue)
+            embed = create_music_embed(player, "✅ Added to Queue", queue)
             embed.add_field(name="Position", value=f"`#{len(queue.queue)}`", inline=True)
-            await interaction.followup.send(embed=embed)
+            embed.add_field(name="Queue Duration", value=f"`{format_queue_duration(queue.total_duration())}`", inline=True)
+            embed.set_footer(text=f"Loaded in {fetch_time:.1f}s | Cord Titan V3")
+            await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
         else:
+            # Start playing immediately
             queue.current = player
-            interaction.guild.voice_client.play(
-                player,
-                after=lambda e: asyncio.run_coroutine_threadsafe(play_next(interaction.guild_id), bot.loop)
-            )
-            bot_stats['songs_played'] += 1
-            embed = create_music_embed(player, "Now Playing", queue)
-            msg = await interaction.followup.send(embed=embed, view=MusicControlView(interaction.guild_id))
-            queue.now_playing_message = msg
+            try:
+                interaction.guild.voice_client.play(
+                    player,
+                    after=lambda e: asyncio.run_coroutine_threadsafe(
+                        play_next(interaction.guild_id), bot.loop
+                    )
+                )
+                bot_stats['songs_played'] += 1
+                
+                embed = create_music_embed(player, "🎵 Now Playing", queue)
+                embed.set_footer(text=f"Loaded in {fetch_time:.1f}s | Cord Titan V3")
+                msg = await InteractionHandler.safe_response(
+                    interaction, embed=embed, view=MusicControlView(interaction.guild_id), edit=True
+                )
+                queue.now_playing_message = msg
+            except Exception as e:
+                embed = create_embed("❌ Playback Error", f"Failed to play: {str(e)}", 0xf44336)
+                await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
+                
     except Exception as e:
-        embed = create_embed("Error", f"Failed to play: {str(e)}", 0xf44336)
-        await interaction.followup.send(embed=embed)
+        logger.error(f"Unexpected error in play command: {e}", exc_info=True)
+        embed = create_embed(
+            "❌ Unexpected Error",
+            f"Something went wrong: {str(e)[:200]}",
+            0xf44336
+        )
+        await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                    ADVANCED PLAYNEXT COMMAND
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="playnext", description="Add a song to play next")
 @app_commands.describe(query="Song name or YouTube URL")
 async def playnext_slash(interaction: discord.Interaction, query: str):
     if not interaction.user.voice:
-        embed = create_embed("Error", "You need to be in a voice channel!", 0xf44336)
+        embed = create_embed("❌ Error", "You need to be in a voice channel!", 0xf44336)
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
     
-    await interaction.response.defer()
+    if not await InteractionHandler.safe_defer(interaction):
+        return
     
-    if not interaction.guild.voice_client:
-        await interaction.user.voice.channel.connect()
+    loading_embed = create_embed("🔍 Searching", f"Looking for: **{query[:100]}**", 0x9b59b6)
+    loading_msg = await InteractionHandler.safe_response(interaction, embed=loading_embed)
     
     try:
+        if not interaction.guild.voice_client:
+            await interaction.user.voice.channel.connect()
+        
         if not query.startswith('http'):
             query = f'ytsearch:{query}'
         
         queue = get_queue(interaction.guild_id)
         queue.text_channel = interaction.channel
-        player = await YTDLSource.from_url(
-            query,
-            loop=bot.loop,
-            stream=True,
-            requester=interaction.user,
-            audio_filter=queue.audio_filter
-        )
-        player.volume = queue.volume / 100
         
+        start_time = time.time()
+        player = await asyncio.wait_for(
+            YTDLSource.from_url(
+                query, loop=bot.loop, stream=True,
+                requester=interaction.user, audio_filter=queue.audio_filter
+            ),
+            timeout=60
+        )
+        fetch_time = time.time() - start_time
+        
+        player.volume = queue.volume / 100
         queue.add_next(player)
-        embed = create_music_embed(player, "Added to Queue", queue)
+        
+        embed = create_music_embed(player, "⏭️ Added Next", queue)
         embed.add_field(name="Position", value="`#1 (Next)`", inline=True)
-        await interaction.followup.send(embed=embed)
+        embed.set_footer(text=f"Loaded in {fetch_time:.1f}s | Cord Titan V3")
+        await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
+        
+    except asyncio.TimeoutError:
+        embed = create_embed("⏱️ Timeout", "Request took too long. Try again.", 0xff9800)
+        await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
     except Exception as e:
-        embed = create_embed("Error", f"Failed to add: {str(e)}", 0xf44336)
-        await interaction.followup.send(embed=embed)
+        logger.error(f"Error in playnext: {e}")
+        embed = create_embed("❌ Error", f"Failed to add: {str(e)[:200]}", 0xf44336)
+        await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#                    ADVANCED SEARCH COMMAND
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @bot.tree.command(name="search", description="Search for songs on YouTube")
 @app_commands.describe(query="Search query")
 async def search_slash(interaction: discord.Interaction, query: str):
-    await interaction.response.defer()
+    if not await InteractionHandler.safe_defer(interaction):
+        return
+    
+    loading_embed = create_embed("🔍 Searching YouTube", f"Query: **{query}**\n\nSearching...", 0x9b59b6)
+    loading_msg = await InteractionHandler.safe_response(interaction, embed=loading_embed)
     
     try:
         search_query = f'ytsearch10:{query}'
-        data = await bot.loop.run_in_executor(None, lambda: ytdl.extract_info(search_query, download=False))
+        
+        # Fetch search results with timeout
+        start_time = time.time()
+        data = await asyncio.wait_for(
+            bot.loop.run_in_executor(
+                None, lambda: ytdl.extract_info(search_query, download=False)
+            ),
+            timeout=30
+        )
+        search_time = time.time() - start_time
         
         if 'entries' not in data or not data['entries']:
-            embed = create_embed("No Results", "No videos found!", 0xf44336)
-            await interaction.followup.send(embed=embed)
+            embed = create_embed("❌ No Results", "No videos found. Try different keywords.", 0xf44336)
+            await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
             return
         
         results = []
         embed = discord.Embed(
-            title="Search Results",
+            title="🔍 Search Results",
             description=f"**Query:** `{query}`\n\nSelect a song from the dropdown below:",
             color=0x9b59b6
         )
@@ -799,14 +1014,15 @@ async def search_slash(interaction: discord.Interaction, query: str):
         for i, entry in enumerate(data['entries'][:10], 1):
             if not entry:
                 continue
-            duration = time.strftime('%M:%S', time.gmtime(entry.get('duration', 0))) if entry.get('duration') else "Live"
+            
+            duration = time.strftime('%M:%S', time.gmtime(entry.get('duration', 0))) if entry.get('duration') else "🔴 Live"
             title = entry.get('title', 'Unknown')
             uploader = entry.get('uploader', 'Unknown')
             views = entry.get('view_count', 0)
             
             embed.add_field(
                 name=f"`{i}.` {title[:55]}{'...' if len(title) > 55 else ''}",
-                value=f"`{duration}` - `{uploader}` - `{views:,} views`",
+                value=f"⏱️ `{duration}` | 👤 `{uploader[:20]}` | 👁️ `{views:,}`",
                 inline=False
             )
             
@@ -819,148 +1035,129 @@ async def search_slash(interaction: discord.Interaction, query: str):
                 'views': views
             })
         
-        embed.set_footer(text="Select from dropdown - Expires in 2 minutes")
-        await interaction.followup.send(embed=embed, view=SearchView(results, interaction.user.id))
-        
-    except Exception as e:
-        embed = create_embed("Error", f"Search failed: {str(e)}", 0xf44336)
-        await interaction.followup.send(embed=embed)
-
-@bot.tree.command(name="skip", description="Skip the current song")
-async def skip_slash(interaction: discord.Interaction):
-    if not await dj_check(interaction):
-        return
-        
-    if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
-        queue = get_queue(interaction.guild_id)
-        queue.votes_skip.clear()
-        interaction.guild.voice_client.stop()
-        embed = create_embed("Skipped", "Moving to next song...", 0x4caf50)
-        await interaction.response.send_message(embed=embed)
-    else:
-        embed = create_embed("Nothing Playing", "No music playing!", 0xf44336)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="voteskip", description="Vote to skip the current song")
-async def voteskip_slash(interaction: discord.Interaction):
-    if not interaction.guild.voice_client or not interaction.guild.voice_client.is_playing():
-        embed = create_embed("Nothing Playing", "No music playing!", 0xf44336)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    queue = get_queue(interaction.guild_id)
-    vc = interaction.guild.voice_client
-    
-    members = [m for m in vc.channel.members if not m.bot]
-    required = max(1, int(len(members) * queue.skip_threshold))
-    
-    queue.votes_skip.add(interaction.user.id)
-    current_votes = len(queue.votes_skip)
-    
-    if current_votes >= required:
-        queue.votes_skip.clear()
-        vc.stop()
-        embed = create_embed("Vote Skip Passed", f"Skipping with {current_votes}/{required} votes!", 0x4caf50)
-        await interaction.response.send_message(embed=embed)
-    else:
-        embed = create_embed("Vote Registered", f"Votes: `{current_votes}/{required}` needed to skip", 0xff9800)
-        await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="pause", description="Pause the current song")
-async def pause_slash(interaction: discord.Interaction):
-    if interaction.guild.voice_client and interaction.guild.voice_client.is_playing():
-        interaction.guild.voice_client.pause()
-        embed = create_embed("Paused", "Music paused", 0xff9800)
-        await interaction.response.send_message(embed=embed)
-    else:
-        embed = create_embed("Nothing Playing", "No music to pause!", 0xf44336)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="resume", description="Resume the paused song")
-async def resume_slash(interaction: discord.Interaction):
-    if interaction.guild.voice_client and interaction.guild.voice_client.is_paused():
-        interaction.guild.voice_client.resume()
-        embed = create_embed("Resumed", "Music resumed!", 0x4caf50)
-        await interaction.response.send_message(embed=embed)
-    else:
-        embed = create_embed("Not Paused", "Music isn't paused!", 0xf44336)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="stop", description="Stop playing and clear queue")
-async def stop_slash(interaction: discord.Interaction):
-    if not await dj_check(interaction):
-        return
-        
-    queue = get_queue(interaction.guild_id)
-    queue.clear()
-    queue.now_playing_message = None
-    if interaction.guild.voice_client:
-        interaction.guild.voice_client.stop()
-    embed = create_embed("Stopped", "Playback stopped and queue cleared!", 0xf44336)
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="replay", description="Replay the current song from the beginning")
-async def replay_slash(interaction: discord.Interaction):
-    queue = get_queue(interaction.guild_id)
-    
-    if not queue.current:
-        embed = create_embed("Nothing Playing", "No song to replay!", 0xf44336)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    if not interaction.guild.voice_client:
-        embed = create_embed("Not Connected", "Bot not in voice channel!", 0xf44336)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    await interaction.response.defer()
-    
-    try:
-        new_source = await queue.current.recreate()
-        new_source.requester = queue.current.requester
-        new_source.volume = queue.volume / 100
-        
-        interaction.guild.voice_client.stop()
-        
-        interaction.guild.voice_client.play(
-            new_source,
-            after=lambda e: asyncio.run_coroutine_threadsafe(play_next(interaction.guild_id), bot.loop)
+        embed.set_footer(text=f"Found {len(results)} results in {search_time:.1f}s | Expires in 2 minutes")
+        await InteractionHandler.safe_response(
+            interaction, embed=embed, view=SearchView(results, interaction.user.id), edit=True
         )
         
-        embed = create_embed("Replaying", f"Restarted **{queue.current.title}**", 0x4caf50)
-        await interaction.followup.send(embed=embed)
+    except asyncio.TimeoutError:
+        embed = create_embed("⏱️ Timeout", "Search took too long. Try again.", 0xff9800)
+        await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
     except Exception as e:
-        embed = create_embed("Error", f"Failed to replay: {str(e)}", 0xf44336)
-        await interaction.followup.send(embed=embed)
+        logger.error(f"Search error: {e}")
+        embed = create_embed("❌ Search Failed", f"Error: {str(e)[:200]}", 0xf44336)
+        await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
 
-@bot.tree.command(name="previous", description="Play the previous song")
-async def previous_slash(interaction: discord.Interaction):
-    queue = get_queue(interaction.guild_id)
-    prev_song = queue.previous()
-    
-    if prev_song and interaction.guild.voice_client:
-        await interaction.response.defer()
-        try:
-            interaction.guild.voice_client.stop()
-            new_source = await prev_song.recreate()
-            new_source.requester = prev_song.requester
-            new_source.volume = queue.volume / 100
-            
-            interaction.guild.voice_client.play(
-                new_source,
-                after=lambda e: asyncio.run_coroutine_threadsafe(play_next(interaction.guild_id), bot.loop)
-            )
-            
-            embed = create_music_embed(prev_song, "Playing Previous", queue)
-            msg = await interaction.followup.send(embed=embed, view=MusicControlView(interaction.guild_id))
-            queue.now_playing_message = msg
-        except Exception as e:
-            embed = create_embed("Error", f"Failed: {str(e)}", 0xf44336)
-            await interaction.followup.send(embed=embed)
-    else:
-        embed = create_embed("No History", "No previous song!", 0xf44336)
+# ═══════════════════════════════════════════════════════════════════════════════
+#                    ADVANCED PLAYLIST COMMAND WITH PROGRESS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@bot.tree.command(name="playlist", description="Play a YouTube playlist")
+@app_commands.describe(url="YouTube playlist URL")
+async def playlist_slash(interaction: discord.Interaction, url: str):
+    if not interaction.user.voice:
+        embed = create_embed("❌ Error", "Join a voice channel first!", 0xf44336)
         await interaction.response.send_message(embed=embed, ephemeral=True)
-
+        return
+    
+    if not await InteractionHandler.safe_defer(interaction):
+        return
+    
+    try:
+        if not interaction.guild.voice_client:
+            await interaction.user.voice.channel.connect()
+        
+        # Initialize progress tracker
+        progress = ProgressTracker(interaction, "📥 Loading Playlist", 100)
+        await progress.start()
+        
+        # Fetch playlist data
+        await progress.update(10, "Fetching playlist information...")
+        data = await asyncio.wait_for(
+            bot.loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False)),
+            timeout=60
+        )
+        
+        if 'entries' not in data:
+            embed = create_embed("❌ Error", "Invalid playlist URL!", 0xf44336)
+            await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
+            return
+        
+        queue = get_queue(interaction.guild_id)
+        queue.text_channel = interaction.channel
+        
+        entries = [e for e in data['entries'][:100] if e]
+        total_songs = len(entries)
+        added_count = 0
+        failed_count = 0
+        first_song = None
+        
+        await progress.update(20, f"Found {total_songs} songs. Loading...")
+        
+        # Process songs with progress updates
+        for idx, entry in enumerate(entries):
+            try:
+                player = await asyncio.wait_for(
+                    YTDLSource.from_url(
+                        entry['webpage_url'], loop=bot.loop, stream=True,
+                        requester=interaction.user, audio_filter=queue.audio_filter
+                    ),
+                    timeout=30
+                )
+                player.volume = queue.volume / 100
+                
+                if not first_song and not interaction.guild.voice_client.is_playing():
+                    first_song = player
+                    queue.current = player
+                    interaction.guild.voice_client.play(
+                        player,
+                        after=lambda e: asyncio.run_coroutine_threadsafe(
+                            play_next(interaction.guild_id), bot.loop
+                        )
+                    )
+                    bot_stats['songs_played'] += 1
+                else:
+                    queue.add(player)
+                
+                added_count += 1
+                
+                # Update progress
+                progress_pct = 20 + int((idx / total_songs) * 80)
+                await progress.update(
+                    progress_pct,
+                    f"Added {added_count}/{total_songs} songs\nCurrent: {entry.get('title', 'Unknown')[:40]}..."
+                )
+                
+            except asyncio.TimeoutError:
+                failed_count += 1
+                logger.warning(f"Timeout loading playlist song: {entry.get('title', 'Unknown')}")
+            except Exception as e:
+                failed_count += 1
+                logger.warning(f"Error loading playlist song: {e}")
+                continue
+        
+        # Final result
+        final_embed = create_embed(
+            "✅ Playlist Added",
+            f"**{data.get('title', 'Playlist')}**\n\n"
+            f"✅ Added: **{added_count}** songs\n"
+            f"{'❌ Failed: **' + str(failed_count) + '** songs' if failed_count > 0 else ''}\n"
+            f"⏱️ Total Duration: `{format_queue_duration(queue.total_duration())}`",
+            0x4caf50
+        )
+        
+        if first_song and first_song.thumbnail:
+            final_embed.set_thumbnail(url=first_song.thumbnail)
+        
+        await progress.complete(final_embed)
+        
+    except asyncio.TimeoutError:
+        embed = create_embed("⏱️ Timeout", "Playlist loading took too long.", 0xff9800)
+        await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
+    except Exception as e:
+        logger.error(f"Playlist error: {e}", exc_info=True)
+        embed = create_embed("❌ Error", f"Failed to load playlist: {str(e)[:200]}", 0xf44336)
+        await InteractionHandler.safe_response(interaction, embed=embed, edit=True)
 # ═══════════════════════════════════════════════════════════════════════════════
 #                              SLASH COMMANDS - QUEUE
 # ═══════════════════════════════════════════════════════════════════════════════
